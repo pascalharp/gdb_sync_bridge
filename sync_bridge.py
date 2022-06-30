@@ -7,6 +7,7 @@ PORT = 8123
 TIMEOUT = 5
 
 import socket
+import json
 import gdb
 
 registers = ["$r0", "$r1", "$r2", "$r3", "$r4", "$r5", "$r6", "$r7", "$r8", "$r9", "$r10", "$r11", "$r12", "$sp", "$lr", "$pc", "$cpsr"]
@@ -14,11 +15,15 @@ registers = ["$r0", "$r1", "$r2", "$r3", "$r4", "$r5", "$r6", "$r7", "$r8", "$r9
 def save_regs():
     regs = {}
     for r in registers:
-        print(r)
-        regs[r] = str(gdb.parse_and_eval(r)).encode()
-        print(regs[r])
-    print(regs)
+        regs[r] = str(gdb.parse_and_eval(r))
     return regs
+
+def reduce_to_unmatched(regs_a, regs_b):
+    unmatched = {}
+    for k in regs_a:
+        if regs_a[k] != regs_b[k]:
+            unmatched[k] = (regs_a[k], regs_b[k])
+    return unmatched
 
 class Plugin(gdb.Command):
 
@@ -58,21 +63,22 @@ class BridgeFollow(gdb.Command):
             return None
 
         try:
-            prev_pc = "Unknown"
-            leader_pc = self.sock.recv(1024).decode()
-            pc = str(gdb.parse_and_eval("$pc"))
-            self.sock.send(leader_pc.encode())
-            print("Own pc {}, leader pc {}".format(pc, leader_pc))
+            leader_regs = json.loads(self.sock.recv(1024).decode())
+            regs = save_regs()
+            self.sock.send(json.dumps(regs).encode())
 
-            while leader_pc == pc:
+            while leader_regs == regs:
                 gdb.execute("si")
-                prev_pc = pc
-                leader_pc = self.sock.recv(1024).decode()
-                pc = str(gdb.parse_and_eval("$pc"))
-                self.sock.send(pc.encode())
+                leader_regs = json.loads(self.sock.recv(1024).decode())
+                regs = save_regs()
+                self.sock.send(json.dumps(regs).encode())
 
-            print("Leader pc {} did not match own pc {}".format(leader_pc, pc))
-            print("Last matching pc {}".format(prev_pc))
+            print("Difference in regs detected")
+            unmatched = reduce_to_unmatched(regs, leader_regs)
+            print("<register> -> (Self, Leader)")
+            for k in unmatched:
+                (a, b) = unmatched[k]
+                print("{} -> ( {} , {} )".format(k, a, b))
 
         except Exception as err:
             print("Error while bridge sync: {}".format(err))
@@ -109,20 +115,22 @@ class BridgeLead(gdb.Command):
         print("Client connected")
 
         try:
-            prev_pc = "Unknown"
-            pc = str(gdb.parse_and_eval("$pc"))
-            self.client_sock.send(pc.encode())
-            follow_pc = self.client_sock.recv(1024).decode()
-            print("Own pc {}, follow pc {}".format(pc, follow_pc))
-            while follow_pc == pc:
-                gdb.execute("si")
-                prev_pc = pc
-                pc = str(gdb.parse_and_eval("$pc"))
-                self.client_sock.send(pc.encode())
-                follow_pc = self.client_sock.recv(1024).decode()
+            regs = save_regs()
+            self.client_sock.send(json.dumps(regs).encode())
+            follow_regs = json.loads(self.client_sock.recv(1024).decode())
 
-            print("Follow pc {} did not match own pc {}".format(follow_pc, pc))
-            print("Last matching pc {}".format(prev_pc))
+            while regs == follow_regs:
+                gdb.execute("si")
+                regs = save_regs()
+                self.client_sock.send(json.dumps(regs).encode())
+                follow_regs = json.loads(self.client_sock.recv(1024).decode())
+
+            print("Difference in regs detected")
+            unmatched = reduce_to_unmatched(regs, follow_regs)
+            print("<register> -> (Self, Follower)")
+            for k in unmatched:
+                (a, b) = unmatched[k]
+                print("{} -> ( {} , {} )".format(k, a, b))
 
         except Exception as err:
             print("Error while bridge sync: {}".format(err))
