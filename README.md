@@ -1,4 +1,4 @@
-# Synchronize two running qemu emulation
+# Synchronize two running qemu emulations
 This is a small python script to synchronize two running gdb instances. The emulation will single step on both instances and then exchange register values over a socket connection. If the values differ the emulation will stop.
 
 This script is currently written for arm32 emulation but can probably be adapted for other architectures as well.
