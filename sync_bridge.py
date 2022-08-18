@@ -12,10 +12,23 @@ import gdb
 
 registers = ["$r0", "$r1", "$r2", "$r3", "$r4", "$r5", "$r6", "$r7", "$r8", "$r9", "$r10", "$r11", "$r12", "$sp", "$lr", "$pc", "$cpsr"]
 
+def int2compl(number):
+    """ Different gdb stub implementations might report values differently"""
+    if number < 0:
+        # a bit hacky
+        return number & 0xffffffff
+    else:
+        return number
+
 def save_regs():
     regs = {}
     for r in registers:
-        regs[r] = str(gdb.parse_and_eval(r))
+        reg_val = str(gdb.parse_and_eval(r))
+        if reg_val.startswith("0x"):
+            reg_val = int(reg_val, 16)
+        else:
+            reg_val = int(reg_val, 10)
+        regs[r] = int2compl(reg_val)
     return regs
 
 def reduce_to_unmatched(regs_a, regs_b):
@@ -68,7 +81,7 @@ class BridgeFollow(gdb.Command):
             self.sock.send(json.dumps(regs).encode())
 
             while leader_regs == regs:
-                gdb.execute("si")
+                gdb.execute("stepi")
                 leader_regs = json.loads(self.sock.recv(1024).decode())
                 regs = save_regs()
                 self.sock.send(json.dumps(regs).encode())
@@ -78,7 +91,7 @@ class BridgeFollow(gdb.Command):
             print("<register> -> (Self, Leader)")
             for k in unmatched:
                 (a, b) = unmatched[k]
-                print("{} -> ( {} , {} )".format(k, a, b))
+                print("{} -> ( {} , {} )".format(k, hex(a), hex(b)))
 
         except Exception as err:
             print("Error while bridge sync: {}".format(err))
@@ -120,7 +133,7 @@ class BridgeLead(gdb.Command):
             follow_regs = json.loads(self.client_sock.recv(1024).decode())
 
             while regs == follow_regs:
-                gdb.execute("si")
+                gdb.execute("stepi")
                 regs = save_regs()
                 self.client_sock.send(json.dumps(regs).encode())
                 follow_regs = json.loads(self.client_sock.recv(1024).decode())
@@ -130,7 +143,7 @@ class BridgeLead(gdb.Command):
             print("<register> -> (Self, Follower)")
             for k in unmatched:
                 (a, b) = unmatched[k]
-                print("{} -> ( {} , {} )".format(k, a, b))
+                print("{} -> ( {} , {} )".format(k, hex(a), hex(b)))
 
         except Exception as err:
             print("Error while bridge sync: {}".format(err))
