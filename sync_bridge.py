@@ -8,9 +8,8 @@ TIMEOUT = 5
 
 import socket
 import json
+from typing import Tuple, List, Dict
 import gdb
-
-registers = ["$r0", "$r1", "$r2", "$r3", "$r4", "$r5", "$r6", "$r7", "$r8", "$r9", "$r10", "$r11", "$r12", "$sp", "$lr", "$pc", "$cpsr"]
 
 def int2compl(number):
     """ Different gdb stub implementations might report values differently"""
@@ -20,23 +19,55 @@ def int2compl(number):
     else:
         return number
 
-def save_regs():
-    regs = {}
-    for r in registers:
-        reg_val = str(gdb.parse_and_eval(r))
-        if reg_val.startswith("0x"):
-            reg_val = int(reg_val, 16)
-        else:
-            reg_val = int(reg_val, 10)
-        regs[r] = int2compl(reg_val)
-    return regs
+def get_reg_values(regs: List[gdb.RegisterDescriptor]) -> List[Tuple[str, int]]:
+    """
+    Returns a list of tuples with the corresponding register and its values
+    The Tupe is in the format: (str, int)
+    """
+    loaded = []
+    frame = gdb.selected_frame()
+    for r in regs:
+        loaded.append( (r.name, int(frame.read_register(r)) & 0xffffffff) ) # hack for unsigned int 32 bit
+    return loaded
 
-def reduce_to_unmatched(regs_a, regs_b):
-    unmatched = {}
-    for k in regs_a:
-        if regs_a[k] != regs_b[k]:
-            unmatched[k] = (regs_a[k], regs_b[k])
-    return unmatched
+def encode_reg_values(rv) -> str:
+    """
+    Encodes the list of tuples returned from get_reg_values to a json string.
+    Format:
+    [
+        {
+            reg: "r0",
+            val: 1234
+        },
+        ...
+    ]
+    """
+    vals = list(map(lambda x: {"reg": x[0], "val": x[1]}, rv ))
+    return json.dumps(vals)
+
+def decode_reg_values(js: str) -> List[Tuple[str, int]]:
+    """
+    Reverse of encode_reg_values.
+    """
+    vals = json.loads(js)
+    return list(map(lambda x: (x["reg"], x["val"]), vals ))
+
+def reduce_to_unmatched(
+        regs_a: List[Tuple[str, int]],
+        regs_b: List[Tuple[str, int]]
+    ) -> Dict[str, Tuple[int, int]]:
+
+    missmatch = {}
+    ra = dict(regs_a)
+    rb = dict(regs_b)
+
+    for k in ra:
+        va = ra[k]
+        vb = rb[k]
+        if va != vb:
+            missmatch[k] = (va, vb)
+
+    return missmatch
 
 class Plugin(gdb.Command):
 
@@ -45,16 +76,23 @@ class Plugin(gdb.Command):
         gdb.Command.__init__(self, "sb_init", gdb.COMMAND_OBSCURE, gdb.COMPLETE_NONE)
         self.host = None
         self.port = None
+        self.all_registers = []
 
     def invoke(self, arg, from_tty):
         # TODO parse args for custom host and port
         self.host = HOST
         self.port = PORT
 
+        # load available registers. This has to be done after target remote
+        # TODO make customizable
+        frame = gdb.selected_frame()
+        arch = frame.architecture()
+        self.all_registers = list(arch.registers())
+
         # register other commands
         cmds = [BridgeFollow(self), BridgeLead(self)]
 
-        print("Registered {} commands".format(len(cmds)))
+        print("Sync Bridge loaded. Registered {} commands".format(len(cmds)))
 
 class BridgeFollow(gdb.Command):
 
@@ -62,6 +100,7 @@ class BridgeFollow(gdb.Command):
         self.plug = plug
         gdb.Command.__init__(self, "sb_follow", gdb.COMMAND_OBSCURE, gdb.COMPLETE_NONE)
         self.sock = None
+        self.regs = []
 
     def invoke(self, arg, from_tty):
 
@@ -76,21 +115,39 @@ class BridgeFollow(gdb.Command):
             return None
 
         try:
-            leader_regs = json.loads(self.sock.recv(1024).decode())
-            regs = save_regs()
-            self.sock.send(json.dumps(regs).encode())
+            # wait for leader regs sync
+            leader_regs = json.loads(self.sock.recv(1024 * 4).decode())
+            for r in self.plug.all_registers:
+                if r.name in leader_regs:
+                    self.regs.append(r)
 
-            while leader_regs == regs:
+            # reply with matching list
+            self.sock.send(json.dumps(list(map(lambda x: x.name, self.regs))).encode())
+
+            print("Register list for sync: {}".format(list(map(lambda x: x.name, self.regs))))
+
+            missmatch: Dict[str, Tuple[int, int]] = {}
+
+            while True:
+                # TODO progress custom skip
+
+                # wait for leader regs over socket
+                leader_regs = decode_reg_values(self.sock.recv(1024).decode())
+                # load own regs and send to leader
+                self_regs = get_reg_values(self.regs)
+                self.sock.send(encode_reg_values(self_regs).encode())
+                # compare
+                missmatch = reduce_to_unmatched(self_regs, leader_regs)
+
+                if len(missmatch) > 0:
+                    break
+
                 gdb.execute("stepi")
-                leader_regs = json.loads(self.sock.recv(1024).decode())
-                regs = save_regs()
-                self.sock.send(json.dumps(regs).encode())
 
-            print("Difference in regs detected")
-            unmatched = reduce_to_unmatched(regs, leader_regs)
+            print("### Difference detected ###")
             print("<register> -> (Self, Leader)")
-            for k in unmatched:
-                (a, b) = unmatched[k]
+            for k in missmatch:
+                (a, b) = missmatch[k]
                 print("{} -> ( {} , {} )".format(k, hex(a), hex(b)))
 
         except Exception as err:
@@ -107,6 +164,7 @@ class BridgeLead(gdb.Command):
         self.sock = None
         self.client_sock = None
         self.client_addr = None
+        self.regs = []
 
     def invoke(self, arg, from_tty):
 
@@ -128,21 +186,40 @@ class BridgeLead(gdb.Command):
         print("Client connected")
 
         try:
-            regs = save_regs()
-            self.client_sock.send(json.dumps(regs).encode())
-            follow_regs = json.loads(self.client_sock.recv(1024).decode())
+            # send regs to follower to sync
+            self.client_sock.send(json.dumps(list(map(lambda x: x.name, self.plug.all_registers))).encode())
 
-            while regs == follow_regs:
+            # wait for follower regs sync
+            follow_regs = json.loads(self.client_sock.recv(1024 * 4).decode())
+            print(follow_regs)
+            print(self.plug.all_registers)
+            for r in self.plug.all_registers:
+                if r.name in follow_regs:
+                    self.regs.append(r)
+
+            print("Register list for sync: {}".format(list(map(lambda x: x.name, self.regs))))
+
+            missmatch: Dict[str, Tuple[int, int]] = {}
+            while True:
+                # TODO progress custom skip
+
+                # load current own registers and send to follower
+                self_regs = get_reg_values(self.regs)
+                self.client_sock.send(encode_reg_values(self_regs).encode())
+                # wait for follower regs
+                follow_regs = decode_reg_values(self.client_sock.recv(1024).decode())
+                # compare
+                missmatch = reduce_to_unmatched(self_regs, follow_regs)
+
+                if len(missmatch) > 0:
+                    break
+
                 gdb.execute("stepi")
-                regs = save_regs()
-                self.client_sock.send(json.dumps(regs).encode())
-                follow_regs = json.loads(self.client_sock.recv(1024).decode())
 
-            print("Difference in regs detected")
-            unmatched = reduce_to_unmatched(regs, follow_regs)
+            print("### Difference detected ###")
             print("<register> -> (Self, Follower)")
-            for k in unmatched:
-                (a, b) = unmatched[k]
+            for k in missmatch:
+                (a, b) = missmatch[k]
                 print("{} -> ( {} , {} )".format(k, hex(a), hex(b)))
 
         except Exception as err:
